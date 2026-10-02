@@ -565,6 +565,39 @@ class ArcusPerpetualDerivativeTests(unittest.IsolatedAsyncioTestCase):
             self.fail("Expected position snapshot to replace stale BTC position with ETH.")
         self.assertEqual(Decimal("1.5"), eth_position.amount)
 
+    async def test_user_stream_position_snapshot_accepts_list_payload(self):
+        connector = self.create_authenticated_connector()
+        connector._initialize_trading_pair_symbols_from_exchange_info(
+            {"markets": [self.btc_market()]}
+        )
+
+        async def user_events():
+            yield {
+                "channel": "positions",
+                "contents": {
+                    "isSnapshot": True,
+                    "positions": [
+                        {
+                            "marketDisplayName": "BTC-USD",
+                            "side": "SHORT",
+                            "size": "0.03",
+                            "averageEntryPrice": "51000",
+                            "unrealizedPnl": "-2.5",
+                            "leverage": "4",
+                        }
+                    ],
+                },
+            }
+
+        connector._iter_user_event_queue = user_events
+        await connector._user_stream_event_listener()
+
+        position = connector._perpetual_trading.get_position("BTC-USD", PositionSide.SHORT)
+        if position is None:
+            self.fail("Expected list-shaped Arcus position snapshot to be tracked.")
+        self.assertEqual(Decimal("0.03"), position.amount)
+        self.assertEqual(Decimal("-2.5"), position.unrealized_pnl)
+
     async def test_flat_position_stream_row_removes_existing_position(self):
         connector = self.create_authenticated_connector()
         connector._initialize_trading_pair_symbols_from_exchange_info(

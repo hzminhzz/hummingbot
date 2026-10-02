@@ -4,7 +4,7 @@ from typing import Callable, List, Optional
 
 from pydantic import Field, model_validator
 
-from hummingbot.core.data_type.common import PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
@@ -106,14 +106,29 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
     def _current_risk_state(self) -> RiskState:
         position_base = Decimal("0")
         market_pnl = Decimal("0")
-        for position in self.positions_held:
-            if (
-                position.connector_name == self.config.connector_name
-                and position.trading_pair == self.config.trading_pair
-            ):
+        connector_positions = None
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            connector_positions = connector.account_positions
+        except (AttributeError, ValueError):
+            connector_positions = None
+
+        if connector_positions is not None:
+            for position in connector_positions.values():
+                if position.trading_pair != self.config.trading_pair:
+                    continue
                 amount = Decimal(position.amount)
-                position_base += amount if position.side == TradeType.BUY else -amount
-                market_pnl += Decimal(position.global_pnl_quote)
+                position_base += amount if position.position_side == PositionSide.LONG else -amount
+                market_pnl += Decimal(position.unrealized_pnl)
+        else:
+            for position in self.positions_held:
+                if (
+                    position.connector_name == self.config.connector_name
+                    and position.trading_pair == self.config.trading_pair
+                ):
+                    amount = Decimal(position.amount)
+                    position_base += amount if position.side == TradeType.BUY else -amount
+                    market_pnl += Decimal(position.global_pnl_quote)
 
         account_pnl = (
             Decimal(self.performance_report.global_pnl_quote)

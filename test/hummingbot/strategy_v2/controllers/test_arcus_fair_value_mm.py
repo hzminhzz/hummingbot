@@ -11,7 +11,7 @@ from arcus_mm.risk import RiskState
 
 from controllers.market_making.arcus_fair_value_mm import ArcusFairValueMMConfig, ArcusFairValueMMController
 from hummingbot.client import settings
-from hummingbot.core.data_type.common import PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.strategy.strategy_v2_base import StrategyV2ConfigBase
 from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
@@ -49,6 +49,7 @@ class FakeMarketDataProvider:
         self.hl_ask = Decimal("1002")
         self.hl_update_id_ms = 1500
         self.order_book_initializations = []
+        self.connector = None
         self.now = 2.0
 
     def initialize_rate_sources(self, sources):
@@ -77,6 +78,11 @@ class FakeMarketDataProvider:
 
     def get_funding_info(self, connector_name, trading_pair):
         return SimpleNamespace(index_price=self.oracle, mark_price=self.mark)
+
+    def get_connector(self, connector_name):
+        if self.connector is None:
+            raise ValueError(f"Connector {connector_name} not found.")
+        return self.connector
 
     async def initialize_order_book(self, connector_name, trading_pair):
         self.order_book_initializations.append((connector_name, trading_pair))
@@ -344,6 +350,45 @@ def test_native_controller_preserves_fail_closed_and_side_specific_toxicity_sema
     assert toxic.bid.action.value == "HOLD"
     assert toxic.bid.reason == "BID_TOXIC"
     assert toxic.ask.action.value == "PLACE"
+
+
+def test_native_controller_uses_exchange_position_as_authoritative_restart_inventory():
+    provider = FakeMarketDataProvider()
+    provider.connector = SimpleNamespace(
+        account_positions={
+            "spy-short": SimpleNamespace(
+                trading_pair="SPY-USD",
+                position_side=PositionSide.SHORT,
+                amount=Decimal("0.06"),
+                unrealized_pnl=Decimal("-1.25"),
+            )
+        }
+    )
+    config = ArcusFairValueMMConfig(
+        id="arcus-restart-risk",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("10"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        max_abs_inventory=Decimal("0.02"),
+        inventory_skew_at_limit=Decimal("1"),
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=FakeExternalReference(),
+    )
+
+    asyncio.run(controller.update_processed_data())
+    risk = controller.processed_data["risk_state"]
+    decision = controller.processed_data["quote_decision"]
+
+    assert risk.position_base == Decimal("-0.06")
+    assert risk.market_pnl == Decimal("-1.25")
+    assert decision.state_reason == "INVENTORY_SHORT_LIMIT"
+    assert decision.ask.action.value == "HOLD"
+    assert decision.bid.action.value == "PLACE"
 
 
 def test_native_controller_exposes_risk_pause_and_volatility_size_reduction():

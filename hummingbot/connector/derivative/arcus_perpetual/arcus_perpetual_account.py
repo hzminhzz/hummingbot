@@ -194,7 +194,13 @@ async def listen_for_user_stream(self: ArcusPerpetualContext) -> None:
                 positions = contents.get("positions", {})
                 if contents.get("isSnapshot"):
                     connector._perpetual_trading._account_positions.clear()
-                for position_data in positions.values():
+                if isinstance(positions, dict):
+                    position_rows = positions.values()
+                elif isinstance(positions, list):
+                    position_rows = positions
+                else:
+                    position_rows = []
+                for position_data in position_rows:
                     position = await position_from_market_data(connector, position_data)
                     if position is not None:
                         position_key = connector._perpetual_trading.position_key(
