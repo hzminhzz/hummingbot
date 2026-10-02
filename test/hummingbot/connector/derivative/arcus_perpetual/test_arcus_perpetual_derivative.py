@@ -14,6 +14,7 @@ import hummingbot.connector.derivative.arcus_perpetual.arcus_perpetual_web_utils
 from hummingbot.connector.derivative.arcus_perpetual.arcus_perpetual_derivative import ArcusPerpetualDerivative
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
+from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.core.event.event_listener import EventListener
 from hummingbot.core.event.events import MarketEvent, OrderCancelledEvent, OrderFilledEvent
 
@@ -147,6 +148,36 @@ class ArcusPerpetualDerivativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hedge_set)
         self.assertIn("one-way", hedge_message)
         self.assertIsNone(await connector._update_trading_fees())
+
+    async def test_budget_checker_uses_usdg_collateral_without_synthetic_conversion_books(self):
+        connector = self.create_connector()
+        rules = await connector._format_trading_rules({"markets": [self.btc_market()]})
+        connector._trading_rules["BTC-USD"] = rules[0]
+        connector._account_balances["USDG"] = Decimal("1000")
+        connector._account_available_balances["USDG"] = Decimal("1000")
+
+        candidates = [
+            PerpetualOrderCandidate(
+                trading_pair="BTC-USD",
+                is_maker=True,
+                order_type=OrderType.LIMIT_MAKER,
+                order_side=side,
+                amount=Decimal("0.001"),
+                price=Decimal("50000"),
+                leverage=Decimal("10"),
+                position_close=False,
+            )
+            for side in (TradeType.BUY, TradeType.SELL)
+        ]
+
+        adjusted = connector.budget_checker.adjust_candidates(candidates)
+
+        for candidate in adjusted:
+            self.assertEqual("USDG", candidate.order_collateral.token)
+            self.assertEqual(Decimal("5"), candidate.order_collateral.amount)
+            self.assertEqual("USDG", candidate.percent_fee_collateral.token)
+            self.assertEqual(Decimal("0.025"), candidate.percent_fee_collateral.amount)
+            self.assertEqual(Decimal("0.001"), candidate.amount)
 
     async def test_order_not_found_classifiers_match_http_404_only(self):
         connector = self.create_connector()

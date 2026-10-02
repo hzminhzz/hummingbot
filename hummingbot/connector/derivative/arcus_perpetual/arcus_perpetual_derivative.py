@@ -1,4 +1,5 @@
 import asyncio
+from copy import copy
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,12 +15,48 @@ from hummingbot.connector.derivative.arcus_perpetual.arcus_perpetual_api_order_b
     ArcusPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.arcus_perpetual.arcus_perpetual_auth import ArcusPerpetualAuth
+from hummingbot.connector.derivative.perpetual_budget_checker import PerpetualBudgetChecker
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.api_throttler.data_types import RateLimit
-from hummingbot.core.data_type.common import OrderType, PositionMode
+from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType
+from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
+from hummingbot.core.data_type.trade_fee import TokenAmount
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+class ArcusPerpetualBudgetChecker(PerpetualBudgetChecker):
+    """Budget checker for Arcus USD contracts collateralized in USDG."""
+
+    def populate_collateral_entries(self, order_candidate: OrderCandidate) -> OrderCandidate:
+        if not isinstance(order_candidate, PerpetualOrderCandidate):
+            return super().populate_collateral_entries(order_candidate)
+
+        candidate = copy(order_candidate)
+        collateral_token = (
+            self._exchange.get_buy_collateral_token(candidate.trading_pair)
+            if candidate.order_side == TradeType.BUY
+            else self._exchange.get_sell_collateral_token(candidate.trading_pair)
+        )
+        notional = candidate.amount * candidate.price
+
+        if candidate.position_close:
+            candidate.order_collateral = None
+            candidate.potential_returns = TokenAmount(collateral_token, notional)
+        else:
+            candidate.order_collateral = TokenAmount(
+                collateral_token,
+                notional / candidate.leverage,
+            )
+            candidate.potential_returns = None
+
+        fee = candidate._get_fee(self._exchange)
+        candidate._populate_percent_fee_collateral_entry(self._exchange, fee)
+        candidate._populate_fixed_fee_collateral_entries(fee)
+        candidate._populate_percent_fee_value(self._exchange, fee)
+        candidate._apply_fee_impact_on_potential_returns(self._exchange, fee)
+        return candidate
 
 
 class ArcusPerpetualDerivative(PerpetualDerivativePyBase):
@@ -53,6 +90,7 @@ class ArcusPerpetualDerivative(PerpetualDerivativePyBase):
         self._market_info_last_update = 0.0
         self._market_info_lock = asyncio.Lock()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        self._budget_checker = ArcusPerpetualBudgetChecker(self)
 
     @property
     def name(self) -> str:
