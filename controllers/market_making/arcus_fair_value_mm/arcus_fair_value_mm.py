@@ -1,10 +1,13 @@
 import asyncio
 from decimal import Decimal
+from itertools import islice
 from typing import Callable, List, Optional
 
 from pydantic import Field, model_validator
 
 from hummingbot.core.data_type.common import PositionMode, PositionSide, PriceType, TradeType
+from hummingbot.core.event.event_forwarder import EventForwarder
+from hummingbot.core.event.events import OrderBookEvent, OrderBookTradeEvent
 from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
@@ -12,13 +15,16 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 
+from .domain.concordance import TradeFlowWindow, concordance_snapshot, depth_imbalance
 from .domain.external_reference import ExternalReferenceQuote
 from .domain.microstructure import MicrostructureState
+from .domain.operating import OperatingState
 from .domain.quote_policy import (
     FairValueState,
     MarketState,
     QuoteAction,
     QuoteDecision,
+    QuoteIntent,
     QuotePolicy,
     QuotePolicyConfig,
     RestingQuote,
@@ -43,7 +49,12 @@ class ArcusFairValueMMConfig(MarketMakingControllerConfigBase):
     external_reference_symbol: str = "XYZ:SP500-USD"
     external_reference_source: str = "hyperliquid_sp500"
     external_reference_connector: str = "hyperliquid_perpetual"
-    reference_anchor_spy_price: Optional[Decimal] = Field(default=None, gt=0)
+    reference_anchor_target_price: Optional[Decimal] = Field(default=None, gt=0)
+    reference_anchor_spy_price: Optional[Decimal] = Field(
+        default=None,
+        gt=0,
+        description="Deprecated alias for reference_anchor_target_price.",
+    )
     reference_anchor_hyperliquid_price: Optional[Decimal] = Field(default=None, gt=0)
     reference_anchor_timestamp_ns: Optional[int] = Field(default=None, gt=0)
     reference_anchor_max_age_seconds: Decimal = Field(default=Decimal("432000"), gt=0)
@@ -51,6 +62,11 @@ class ArcusFairValueMMConfig(MarketMakingControllerConfigBase):
 
     max_abs_inventory: Optional[Decimal] = Field(default=None, gt=0)
     inventory_skew_at_limit: Decimal = Field(default=Decimal("0"), ge=0, le=1)
+    reprice_hysteresis_bps: Decimal = Field(default=Decimal("0"), ge=0)
+
+    enable_concordance_veto: bool = Field(default=False)
+    concordance_window_seconds: Decimal = Field(default=Decimal("5"), gt=0)
+    concordance_book_levels: int = Field(default=5, ge=1, le=20)
     market_loss_limit: Optional[Decimal] = Field(default=None, gt=0)
     account_loss_limit: Optional[Decimal] = Field(default=None, gt=0)
     risk_recovery_fraction: Decimal = Field(default=Decimal("0.8"), gt=0, lt=1)
@@ -62,9 +78,11 @@ class ArcusFairValueMMConfig(MarketMakingControllerConfigBase):
     toxic_recovery_bps: Decimal = Decimal("0")
 
     @model_validator(mode="after")
-    def default_quote_notional_to_total_amount(self):
+    def apply_compatibility_defaults(self):
         if self.quote_notional is None:
             self.quote_notional = self.total_amount_quote
+        if self.reference_anchor_target_price is None and self.reference_anchor_spy_price is not None:
+            self.reference_anchor_target_price = self.reference_anchor_spy_price
         return self
 
 
@@ -83,8 +101,20 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
         self.config = config
         self._external_reference_client = external_reference_client
         self._reference_order_book_initialized = False
-        self._microstructure_state_provider = microstructure_state_provider or (lambda: None)
+        self._microstructure_state_provider = microstructure_state_provider
+        self._concordance_trade_flow = TradeFlowWindow(self._observer_config_value("concordance_window_seconds"))
+        self._concordance_trade_forwarder = EventForwarder(self._on_public_trade)
+        self._concordance_order_book = None
+        self._telemetry_cycles = 0
+        self._telemetry_bid_eligible_cycles = 0
+        self._telemetry_ask_eligible_cycles = 0
+        self._telemetry_bid_toxic_cycles = 0
+        self._telemetry_ask_toxic_cycles = 0
+        self._telemetry_fault_cycles = 0
         self._policy = QuotePolicy(self._quote_policy_config())
+
+    def _observer_config_value(self, name: str):
+        return getattr(self.config, name)
 
     def _quote_policy_config(self) -> QuotePolicyConfig:
         return QuotePolicyConfig(
@@ -93,6 +123,7 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             max_reference_disagreement_bps=self.config.max_reference_disagreement_bps,
             max_abs_inventory=self.config.max_abs_inventory,
             inventory_skew_at_limit=self.config.inventory_skew_at_limit,
+            reprice_hysteresis_bps=self.config.reprice_hysteresis_bps,
             market_loss_limit=self.config.market_loss_limit,
             account_loss_limit=self.config.account_loss_limit,
             risk_recovery_fraction=self.config.risk_recovery_fraction,
@@ -102,6 +133,81 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             toxic_markout_threshold_bps=self.config.toxic_markout_threshold_bps,
             toxic_recovery_bps=self.config.toxic_recovery_bps,
         )
+
+    def _on_public_trade(self, event: OrderBookTradeEvent) -> None:
+        if event.trading_pair != self.config.trading_pair:
+            return
+        self._concordance_trade_flow.add(
+            timestamp=Decimal(str(event.timestamp)),
+            is_buy=event.type is TradeType.BUY,
+            amount=Decimal(str(event.amount)),
+        )
+
+    def _ensure_concordance_subscription(self):
+        if not self.config.enable_concordance_veto or self._microstructure_state_provider is not None:
+            return None
+        order_book = self.market_data_provider.get_order_book(
+            self.config.connector_name,
+            self.config.trading_pair,
+        )
+        if order_book is self._concordance_order_book:
+            return order_book
+        if self._concordance_order_book is not None:
+            try:
+                self._concordance_order_book.remove_listener(
+                    OrderBookEvent.TradeEvent,
+                    self._concordance_trade_forwarder,
+                )
+            except Exception:
+                self.logger().warning("Failed to detach prior Arcus trade listener.", exc_info=True)
+        order_book.add_listener(OrderBookEvent.TradeEvent, self._concordance_trade_forwarder)
+        self._concordance_order_book = order_book
+        return order_book
+
+    def _live_concordance_microstructure(self, now_ns: int) -> Optional[MicrostructureState]:
+        order_book = self._ensure_concordance_subscription()
+        if order_book is None:
+            return None
+
+        levels = self.config.concordance_book_levels
+        bid_amounts = [Decimal(str(row.amount)) for row in islice(order_book.bid_entries(), levels)]
+        ask_amounts = [Decimal(str(row.amount)) for row in islice(order_book.ask_entries(), levels)]
+        if not bid_amounts or not ask_amounts:
+            raise RuntimeError("Arcus order book has no usable depth for concordance veto")
+
+        book_imbalance = depth_imbalance(bid_amounts, ask_amounts)
+        trade_imbalance, trade_events = self._concordance_trade_flow.imbalance(
+            Decimal(now_ns) / Decimal("1000000000")
+        )
+        snapshot = concordance_snapshot(
+            book_imbalance=book_imbalance,
+            trade_imbalance=trade_imbalance,
+            trade_events=trade_events,
+        )
+        return MicrostructureState(
+            volatility_bps=Decimal("0"),
+            bid_toxic_override=snapshot.toxic_bid,
+            ask_toxic_override=snapshot.toxic_ask,
+            book_imbalance=snapshot.book_imbalance,
+            trade_imbalance=snapshot.trade_imbalance,
+        )
+
+    def _current_microstructure_state(self, now_ns: int) -> Optional[MicrostructureState]:
+        if self._microstructure_state_provider is not None:
+            return self._microstructure_state_provider()
+        if self.config.enable_concordance_veto:
+            return self._live_concordance_microstructure(now_ns)
+        return None
+
+    def on_stop(self):
+        if self._concordance_order_book is not None:
+            try:
+                self._concordance_order_book.remove_listener(
+                    OrderBookEvent.TradeEvent,
+                    self._concordance_trade_forwarder,
+                )
+            finally:
+                self._concordance_order_book = None
 
     def _current_risk_state(self) -> RiskState:
         position_base = Decimal("0")
@@ -184,15 +290,15 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
                 self.config.external_reference_symbol,
             )
 
-        anchor_spy = self.config.reference_anchor_spy_price
+        anchor_target = self.config.reference_anchor_target_price
         anchor_hl = self.config.reference_anchor_hyperliquid_price
         anchor_ts = self.config.reference_anchor_timestamp_ns
-        if anchor_spy is None or anchor_hl is None or anchor_ts is None:
-            return self._invalid_reference("hyperliquid_sp500:MISSING_ANCHOR")
+        if anchor_target is None or anchor_hl is None or anchor_ts is None:
+            return self._invalid_reference(f"{self.config.external_reference_source}:MISSING_ANCHOR")
 
         anchor_max_age_ns = int(self.config.reference_anchor_max_age_seconds * Decimal("1000000000"))
         if now_ns - anchor_ts > anchor_max_age_ns:
-            return self._invalid_reference("hyperliquid_sp500:STALE_ANCHOR")
+            return self._invalid_reference(f"{self.config.external_reference_source}:STALE_ANCHOR")
 
         if not self._reference_order_book_initialized:
             initialized = await self.market_data_provider.initialize_order_book(
@@ -200,8 +306,24 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
                 self.config.external_reference_symbol,
             )
             if not initialized:
-                return self._invalid_reference("hyperliquid_sp500:ORDER_BOOK_INIT_FAILED")
+                return self._invalid_reference(
+                    f"{self.config.external_reference_source}:ORDER_BOOK_INIT_FAILED"
+                )
             self._reference_order_book_initialized = True
+
+        reference_connector = self.market_data_provider.get_connector_with_fallback(
+            self.config.external_reference_connector
+        )
+        tracker = getattr(reference_connector, "order_book_tracker", None)
+        data_source = getattr(tracker, "data_source", None)
+        ws_assistant = getattr(data_source, "_ws_assistant", None)
+        last_recv_time = float(getattr(ws_assistant, "last_recv_time", 0) or 0)
+        now_seconds = now_ns / 1_000_000_000
+        if (
+            last_recv_time <= 0
+            or now_seconds - last_recv_time > float(self.config.reference_stale_after_seconds)
+        ):
+            return self._invalid_reference(f"{self.config.external_reference_source}:STALE_PUBLIC_FEED")
 
         order_book = self.market_data_provider.get_order_book(
             self.config.external_reference_connector,
@@ -210,25 +332,56 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
         bid = Decimal(str(order_book.get_price(False)))
         ask = Decimal(str(order_book.get_price(True)))
         if bid <= 0 or ask <= 0 or ask < bid:
-            return self._invalid_reference("hyperliquid_sp500:INVALID_BOOK")
+            return self._invalid_reference(f"{self.config.external_reference_source}:INVALID_BOOK")
 
         mid = (bid + ask) / Decimal("2")
         spread_bps = (ask - bid) / mid * Decimal("10000")
         if spread_bps > self.config.reference_max_spread_bps:
-            return self._invalid_reference("hyperliquid_sp500:WIDE_BOOK")
+            return self._invalid_reference(f"{self.config.external_reference_source}:WIDE_BOOK")
 
-        update_id_ms = max(int(order_book.snapshot_uid), int(order_book.last_diff_uid))
-        observed_at_ns = update_id_ms * 1_000_000
-        ratio = anchor_spy / anchor_hl
+        ratio = anchor_target / anchor_hl
         return ExternalReferenceQuote(
             symbol=self.config.external_reference_symbol,
             price=mid * ratio,
-            observed_at_ns=observed_at_ns,
+            # Freshness is the local receive time of the public Hyperliquid WebSocket,
+            # so an unchanged but healthy book remains valid while a dead socket fails closed.
+            observed_at_ns=int(last_recv_time * 1_000_000_000),
             source=f"hyperliquid:{self.config.external_reference_symbol}:anchored_ratio",
         )
 
-    async def update_processed_data(self):
-        now_ns = int(self.market_data_provider.time() * 1_000_000_000)
+    def _fault_decision(self, reason: str, now_ns: int) -> QuoteDecision:
+        resting = self._current_resting_quotes()
+        state_id = f"{self.config.trading_pair}:fault:{now_ns}"
+
+        def closed(side: str) -> QuoteIntent:
+            quote = resting.get(side)
+            if quote is None:
+                return QuoteIntent(
+                    action=QuoteAction.HOLD,
+                    price=None,
+                    size=None,
+                    reason=reason,
+                    state_id=state_id,
+                )
+            return QuoteIntent(
+                action=QuoteAction.CANCEL,
+                price=quote.price,
+                size=quote.size,
+                reason=reason,
+                state_id=state_id,
+            )
+
+        return QuoteDecision(
+            bid=closed("bid"),
+            ask=closed("ask"),
+            state=OperatingState.FAULT,
+            state_reason=reason,
+        )
+
+    async def _update_processed_data_inner(self, now_ns: int):
+        if getattr(self.market_data_provider, "ready", True) is False:
+            raise RuntimeError("market data provider is not ready")
+
         bid = Decimal(
             self.market_data_provider.get_price_by_type(
                 self.config.connector_name,
@@ -243,6 +396,9 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
                 PriceType.BestAsk,
             )
         )
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise RuntimeError("invalid Arcus BBO")
+
         funding_info = self.market_data_provider.get_funding_info(
             self.config.connector_name,
             self.config.trading_pair,
@@ -266,7 +422,7 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             confidence=Decimal("1"),
         )
         risk = self._current_risk_state()
-        microstructure = self._microstructure_state_provider()
+        microstructure = self._current_microstructure_state(now_ns)
         decision: QuoteDecision = self._policy.decide(
             market=market,
             fair=fair,
@@ -285,6 +441,81 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             "state_reason": decision.state_reason,
             "reference_price": fair.price,
             "spread_multiplier": Decimal("1"),
+        }
+        self._record_telemetry(decision)
+
+    async def update_processed_data(self):
+        now_ns = int(self.market_data_provider.time() * 1_000_000_000)
+        try:
+            await self._update_processed_data_inner(now_ns)
+        except Exception as exc:
+            self.logger().error(
+                "Arcus MVP data/policy update failed closed for %s: %s",
+                self.config.trading_pair,
+                exc,
+                exc_info=True,
+            )
+            decision = self._fault_decision("MARKET_DATA_FAULT", now_ns)
+            self.processed_data = {
+                "market_state": None,
+                "fair_value_state": None,
+                "risk_state": None,
+                "microstructure_state": None,
+                "quote_decision": decision,
+                "state": decision.state,
+                "state_reason": decision.state_reason,
+                "reference_price": Decimal("0"),
+                "spread_multiplier": Decimal("1"),
+            }
+            self._telemetry_cycles += 1
+            self._telemetry_fault_cycles += 1
+
+    def _record_telemetry(self, decision: QuoteDecision) -> None:
+        self._telemetry_cycles += 1
+        if decision.bid.action in (QuoteAction.PLACE, QuoteAction.KEEP):
+            self._telemetry_bid_eligible_cycles += 1
+        if decision.ask.action in (QuoteAction.PLACE, QuoteAction.KEEP):
+            self._telemetry_ask_eligible_cycles += 1
+        if decision.bid.reason == "BID_TOXIC":
+            self._telemetry_bid_toxic_cycles += 1
+        if decision.ask.reason == "ASK_TOXIC":
+            self._telemetry_ask_toxic_cycles += 1
+
+    def get_custom_info(self) -> dict:
+        decision = self.processed_data.get("quote_decision")
+        fair = self.processed_data.get("fair_value_state")
+        risk = self.processed_data.get("risk_state")
+        micro = self.processed_data.get("microstructure_state")
+        cycles = max(self._telemetry_cycles, 1)
+        active = sorted(self._active_quote_executors().keys())
+
+        def dec(value):
+            return None if value is None else str(value)
+
+        return {
+            "pair": self.config.trading_pair,
+            "observation_only": self.config.observation_only,
+            "state": None if decision is None else decision.state.value,
+            "state_reason": None if decision is None else decision.state_reason,
+            "bid_action": None if decision is None else decision.bid.action.value,
+            "bid_reason": None if decision is None else decision.bid.reason,
+            "ask_action": None if decision is None else decision.ask.action.value,
+            "ask_reason": None if decision is None else decision.ask.reason,
+            "active_quote_sides": active,
+            "position_base": dec(None if risk is None else risk.position_base),
+            "reference_price": dec(None if fair is None else fair.price),
+            "reference_source": None if fair is None else fair.source,
+            "book_imbalance": dec(None if micro is None else micro.book_imbalance),
+            "trade_imbalance": dec(None if micro is None else micro.trade_imbalance),
+            "cycles": self._telemetry_cycles,
+            "bid_eligible_ratio": self._telemetry_bid_eligible_cycles / cycles,
+            "ask_eligible_ratio": self._telemetry_ask_eligible_cycles / cycles,
+            "bid_toxic_ratio": self._telemetry_bid_toxic_cycles / cycles,
+            "ask_toxic_ratio": self._telemetry_ask_toxic_cycles / cycles,
+            "fault_ratio": self._telemetry_fault_cycles / cycles,
+            "quote_notional": str(self.config.quote_notional),
+            "max_abs_inventory": dec(self.config.max_abs_inventory),
+            "rwa_market": self.config.trading_pair in {"SPY-USD", "QQQ-USD", "GLD-USD"},
         }
 
     def _create_quote_action(self, side: str, price: Decimal, amount: Decimal) -> CreateExecutorAction:

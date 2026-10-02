@@ -12,6 +12,7 @@ from arcus_mm.risk import RiskState
 from controllers.market_making.arcus_fair_value_mm import ArcusFairValueMMConfig, ArcusFairValueMMController
 from hummingbot.client import settings
 from hummingbot.core.data_type.common import PositionMode, PositionSide, PriceType, TradeType
+from hummingbot.core.event.events import OrderBookTradeEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2ConfigBase
 from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
@@ -50,6 +51,7 @@ class FakeMarketDataProvider:
         self.hl_update_id_ms = 1500
         self.order_book_initializations = []
         self.connector = None
+        self.reference_last_recv_time = 2.0
         self.now = 2.0
 
     def initialize_rate_sources(self, sources):
@@ -84,11 +86,25 @@ class FakeMarketDataProvider:
             raise ValueError(f"Connector {connector_name} not found.")
         return self.connector
 
+    def get_connector_with_fallback(self, connector_name):
+        assert connector_name == "hyperliquid_perpetual"
+        return SimpleNamespace(
+            order_book_tracker=SimpleNamespace(
+                data_source=SimpleNamespace(
+                    _ws_assistant=SimpleNamespace(last_recv_time=self.reference_last_recv_time)
+                )
+            )
+        )
+
     async def initialize_order_book(self, connector_name, trading_pair):
         self.order_book_initializations.append((connector_name, trading_pair))
         return True
 
     def get_order_book(self, connector_name, trading_pair):
+        if connector_name == "arcus_perpetual":
+            if not hasattr(self, "arcus_order_book"):
+                raise AssertionError("Arcus order book not configured for this test")
+            return self.arcus_order_book
         assert connector_name == "hyperliquid_perpetual"
         assert trading_pair == "XYZ:SP500-USD"
         return SimpleNamespace(
@@ -110,6 +126,28 @@ class FakeExternalReference:
             observed_at_ns=self.observed_at_ns,
             source="fake:SPY",
         )
+
+
+class FakeArcusOrderBook:
+    def __init__(self, bid_amounts, ask_amounts):
+        self.bid_amounts = [Decimal(str(x)) for x in bid_amounts]
+        self.ask_amounts = [Decimal(str(x)) for x in ask_amounts]
+        self.listeners = []
+
+    def bid_entries(self):
+        for i, amount in enumerate(self.bid_amounts):
+            yield SimpleNamespace(price=100 - i, amount=amount)
+
+    def ask_entries(self):
+        for i, amount in enumerate(self.ask_amounts):
+            yield SimpleNamespace(price=101 + i, amount=amount)
+
+    def add_listener(self, event_tag, listener):
+        self.listeners.append((event_tag, listener))
+
+    def remove_listener(self, event_tag, listener):
+        if (event_tag, listener) in self.listeners:
+            self.listeners.remove((event_tag, listener))
 
 
 def test_arcus_native_controller_shell_uses_standard_market_making_bases_and_emits_no_actions():
@@ -192,7 +230,7 @@ def test_native_controller_builds_fresh_spy_fair_value_from_hyperliquid_anchor()
     decision = controller.processed_data["quote_decision"]
 
     assert fair.price == Decimal("100.1")
-    assert fair.observed_at_ns == 1_500_000_000
+    assert fair.observed_at_ns == 2_000_000_000
     assert fair.source == "hyperliquid:XYZ:SP500-USD:anchored_ratio"
     assert decision.state.value == OperatingState.GOOD.value
     assert provider.order_book_initializations == [("hyperliquid_perpetual", "XYZ:SP500-USD")]
@@ -201,7 +239,7 @@ def test_native_controller_builds_fresh_spy_fair_value_from_hyperliquid_anchor()
     assert provider.order_book_initializations == [("hyperliquid_perpetual", "XYZ:SP500-USD")]
 
 
-def test_hyperliquid_reference_fails_closed_on_stale_live_book_and_stale_anchor():
+def test_hyperliquid_reference_uses_connector_health_not_price_change_frequency_and_fails_on_stale_anchor():
     provider = FakeMarketDataProvider()
     config = ArcusFairValueMMConfig(
         id="arcus-hl-stale",
@@ -222,12 +260,21 @@ def test_hyperliquid_reference_fails_closed_on_stale_live_book_and_stale_anchor(
     )
 
     provider.now = 10.0
+    provider.reference_last_recv_time = 10.0
     provider.hl_update_id_ms = 1_000
     asyncio.run(controller.update_processed_data())
-    stale_book = controller.processed_data["quote_decision"]
-    assert stale_book.state.value == OperatingState.FAULT.value
-    assert stale_book.state_reason == "STALE_REFERENCE"
+    unchanged_book = controller.processed_data["quote_decision"]
+    assert unchanged_book.state.value == OperatingState.GOOD.value
+    assert controller.processed_data["fair_value_state"].observed_at_ns == 10_000_000_000
 
+    provider.reference_last_recv_time = 8.0
+    asyncio.run(controller.update_processed_data())
+    disconnected = controller.processed_data["quote_decision"]
+    assert disconnected.state.value == OperatingState.FAULT.value
+    assert disconnected.state_reason == "INVALID_REFERENCE"
+    assert controller.processed_data["fair_value_state"].source == "hyperliquid_sp500:STALE_PUBLIC_FEED"
+
+    provider.reference_last_recv_time = 200.0
     provider.now = 200.0
     provider.hl_update_id_ms = 200_000
     asyncio.run(controller.update_processed_data())
@@ -581,3 +628,135 @@ def test_observation_mode_never_emits_native_executor_actions():
     asyncio.run(controller.update_processed_data())
     assert controller.processed_data["quote_decision"].bid.action.value == "PLACE"
     assert controller.determine_executor_actions() == []
+
+
+def test_mvp_reprice_hysteresis_preserves_queue_until_drift_exceeds_threshold():
+    provider = FakeMarketDataProvider()
+    external = FakeExternalReference(observed_at_ns=1_500_000_000)
+    config = ArcusFairValueMMConfig(
+        id="arcus-hysteresis",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        reprice_hysteresis_bps=Decimal("0.3"),
+        observation_only=False,
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=external,
+    )
+    controller.executors_info = [
+        make_active_quote_executor("bid-h", TradeType.BUY, Decimal("100"), Decimal("0.5")),
+        make_active_quote_executor("ask-h", TradeType.SELL, Decimal("101"), Decimal("0.5")),
+    ]
+
+    provider.bid = Decimal("100.002")
+    provider.ask = Decimal("101.002")
+    asyncio.run(controller.update_processed_data())
+    within = controller.processed_data["quote_decision"]
+    assert within.bid.action.value == "KEEP"
+    assert within.bid.reason == "BID_QUEUE_HYSTERESIS"
+    assert within.ask.action.value == "KEEP"
+    assert within.ask.reason == "ASK_QUEUE_HYSTERESIS"
+    assert controller.determine_executor_actions() == []
+
+    provider.bid = Decimal("100.01")
+    provider.ask = Decimal("101.01")
+    asyncio.run(controller.update_processed_data())
+    moved = controller.determine_executor_actions()
+    assert {type(action) for action in moved} == {StopExecutorAction}
+    assert {action.executor_id for action in moved} == {"bid-h", "ask-h"}
+
+
+def test_mvp_live_concordance_veto_suppresses_only_adverse_side():
+    provider = FakeMarketDataProvider()
+    provider.arcus_order_book = FakeArcusOrderBook(
+        bid_amounts=[Decimal("10"), Decimal("8"), Decimal("6")],
+        ask_amounts=[Decimal("1"), Decimal("1"), Decimal("1")],
+    )
+    config = ArcusFairValueMMConfig(
+        id="arcus-concordance",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        enable_concordance_veto=True,
+        concordance_window_seconds=Decimal("5"),
+        concordance_book_levels=5,
+        observation_only=False,
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=FakeExternalReference(observed_at_ns=1_500_000_000),
+    )
+    controller._on_public_trade(
+        OrderBookTradeEvent(
+            trading_pair="SPY-USD",
+            timestamp=1.8,
+            type=TradeType.BUY,
+            price=Decimal("101"),
+            amount=Decimal("2"),
+        )
+    )
+
+    asyncio.run(controller.update_processed_data())
+    micro = controller.processed_data["microstructure_state"]
+    decision = controller.processed_data["quote_decision"]
+    actions = controller.determine_executor_actions()
+
+    assert micro.book_imbalance > 0
+    assert micro.trade_imbalance > 0
+    assert micro.ask_toxic_override is True
+    assert micro.bid_toxic_override is False
+    assert decision.bid.action.value == "PLACE"
+    assert decision.ask.action.value == "HOLD"
+    assert decision.ask.reason == "ASK_TOXIC"
+    assert len(actions) == 1
+    assert actions[0].executor_config.side is TradeType.BUY
+    assert len(provider.arcus_order_book.listeners) == 1
+
+    info = controller.get_custom_info()
+    assert info["pair"] == "SPY-USD"
+    assert info["book_imbalance"] == str(micro.book_imbalance)
+    assert info["trade_imbalance"] == str(micro.trade_imbalance)
+    assert info["ask_action"] == "HOLD"
+    assert info["ask_reason"] == "ASK_TOXIC"
+    assert info["ask_toxic_ratio"] == 1.0
+    assert info["bid_eligible_ratio"] == 1.0
+
+
+def test_mvp_market_data_fault_cancels_existing_quotes_fail_closed():
+    provider = FakeMarketDataProvider()
+    config = ArcusFairValueMMConfig(
+        id="arcus-fault",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        observation_only=False,
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=FakeExternalReference(observed_at_ns=1_500_000_000),
+    )
+    controller.executors_info = [
+        make_active_quote_executor("bid-f", TradeType.BUY, Decimal("100"), Decimal("0.5")),
+        make_active_quote_executor("ask-f", TradeType.SELL, Decimal("101"), Decimal("0.5")),
+    ]
+
+    provider.ready = False
+    asyncio.run(controller.update_processed_data())
+    decision = controller.processed_data["quote_decision"]
+    actions = controller.determine_executor_actions()
+
+    assert decision.state.value == OperatingState.FAULT.value
+    assert decision.state_reason == "MARKET_DATA_FAULT"
+    assert {type(action) for action in actions} == {StopExecutorAction}
+    assert {action.executor_id for action in actions} == {"bid-f", "ask-f"}

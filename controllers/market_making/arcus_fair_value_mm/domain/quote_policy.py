@@ -68,6 +68,7 @@ class QuotePolicyConfig:
 
     max_abs_inventory: Decimal | None = None
     inventory_skew_at_limit: Decimal = Decimal("0")
+    reprice_hysteresis_bps: Decimal = Decimal("0")
     market_loss_limit: Decimal | None = None
     account_loss_limit: Decimal | None = None
     risk_recovery_fraction: Decimal = Decimal("0.8")
@@ -87,6 +88,8 @@ class QuotePolicy:
             raise ValueError("max_abs_inventory must be positive")
         if not Decimal("0") <= config.inventory_skew_at_limit <= Decimal("1"):
             raise ValueError("inventory_skew_at_limit must be between 0 and 1")
+        if config.reprice_hysteresis_bps < 0:
+            raise ValueError("reprice_hysteresis_bps must be non-negative")
         if not Decimal("0") < config.risk_recovery_fraction < Decimal("1"):
             raise ValueError("risk_recovery_fraction must be between 0 and 1")
         if not Decimal("0") < config.volatile_size_multiplier <= Decimal("1"):
@@ -128,6 +131,7 @@ class QuotePolicy:
         bid = self._side_intent(
             side="bid",
             safe=market.bid <= upper_bid,
+            resting_safe=resting.get("bid") is None or resting["bid"].price <= upper_bid,
             target_price=market.bid,
             state_id=state_id,
             resting=resting.get("bid"),
@@ -137,6 +141,7 @@ class QuotePolicy:
         ask = self._side_intent(
             side="ask",
             safe=market.ask >= lower_ask,
+            resting_safe=resting.get("ask") is None or resting["ask"].price >= lower_ask,
             target_price=market.ask,
             state_id=state_id,
             resting=resting.get("ask"),
@@ -248,12 +253,12 @@ class QuotePolicy:
         if microstructure is None:
             return OperatingState.GOOD, "NORMAL", Decimal("1"), False, False
 
-        toxic_bid = self._side_is_toxic(
+        toxic_bid = getattr(microstructure, "bid_toxic_override", False) or self._side_is_toxic(
             current=microstructure.bid_recent_markout_bps,
             side=FillSide.BID,
             microstructure=microstructure,
         )
-        toxic_ask = self._side_is_toxic(
+        toxic_ask = getattr(microstructure, "ask_toxic_override", False) or self._side_is_toxic(
             current=microstructure.ask_recent_markout_bps,
             side=FillSide.ASK,
             microstructure=microstructure,
@@ -343,6 +348,7 @@ class QuotePolicy:
         self,
         side: str,
         safe: bool,
+        resting_safe: bool,
         target_price: Decimal,
         state_id: str,
         resting: RestingQuote | None,
@@ -363,15 +369,15 @@ class QuotePolicy:
                 f"{side.upper()}_SAFE_AT_TOUCH",
                 state_id,
             )
+        if size_multiplier < Decimal("1") and resting.size > target_size:
+            return QuoteIntent(
+                QuoteAction.MOVE,
+                target_price,
+                target_size,
+                f"{side.upper()}_RESIZE_AT_TOUCH",
+                state_id,
+            )
         if resting.price == target_price:
-            if size_multiplier < Decimal("1") and resting.size > target_size:
-                return QuoteIntent(
-                    QuoteAction.MOVE,
-                    target_price,
-                    target_size,
-                    f"{side.upper()}_RESIZE_AT_TOUCH",
-                    state_id,
-                )
             return QuoteIntent(
                 QuoteAction.KEEP,
                 resting.price,
@@ -379,6 +385,16 @@ class QuotePolicy:
                 f"{side.upper()}_QUEUE_PRESERVED",
                 state_id,
             )
+        if resting_safe and self.config.reprice_hysteresis_bps > 0:
+            drift_bps = abs(resting.price - target_price) / target_price * _BPS
+            if drift_bps <= self.config.reprice_hysteresis_bps:
+                return QuoteIntent(
+                    QuoteAction.KEEP,
+                    resting.price,
+                    resting.size,
+                    f"{side.upper()}_QUEUE_HYSTERESIS",
+                    state_id,
+                )
         return QuoteIntent(
             QuoteAction.MOVE,
             target_price,

@@ -26,6 +26,10 @@ class MicrostructureState:
     ask_recent_markout_bps: Decimal | None = None
     previous_state: OperatingState = OperatingState.GOOD
     previous_toxic_side: FillSide | None = None
+    bid_toxic_override: bool = False
+    ask_toxic_override: bool = False
+    book_imbalance: Decimal | None = None
+    trade_imbalance: Decimal | None = None
 
 
 def signed_markout_bps(side: FillSide, fill_price: Decimal, future_price: Decimal) -> Decimal:
