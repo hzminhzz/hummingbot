@@ -7,9 +7,17 @@ from arcus_mm.external_reference import ExternalReferenceQuote
 from arcus_mm.microstructure import FillSide, MicrostructureState
 from arcus_mm.operating import OperatingState
 from arcus_mm.quote_policy import FairValueState, MarketState, QuotePolicy, QuotePolicyConfig
-from arcus_mm.risk import RiskState
 
 from controllers.market_making.arcus_fair_value_mm import ArcusFairValueMMConfig, ArcusFairValueMMController
+from controllers.market_making.arcus_fair_value_mm.domain.quote_policy import (
+    FairValueState as NativeFairValueState,
+    MarketState as NativeMarketState,
+    MicrostructureState as NativeMicrostructureState,
+    QuotePolicy as NativeQuotePolicy,
+    QuotePolicyConfig as NativeQuotePolicyConfig,
+    RestingQuote,
+    RiskState as NativeRiskState,
+)
 from hummingbot.client import settings
 from hummingbot.core.data_type.common import PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.core.event.events import OrderBookTradeEvent
@@ -35,6 +43,173 @@ def decision_signature(decision):
         decision.state.value,
         decision.state_reason,
     )
+
+
+def make_inventory_policy():
+    return NativeQuotePolicy(
+        NativeQuotePolicyConfig(
+            quote_notional=Decimal("100"),
+            max_quote_deviation_bps=Decimal("100"),
+            max_reference_disagreement_bps=Decimal("100"),
+            max_abs_inventory=Decimal("0.15"),
+        )
+    )
+
+
+def make_inventory_market(min_order_size=Decimal("0.001"), min_notional_size=Decimal("5")):
+    return NativeMarketState(
+        symbol="SPY-USD",
+        bid=Decimal("750"),
+        ask=Decimal("751"),
+        oracle=Decimal("750.5"),
+        mark=Decimal("750.5"),
+        observed_at_ns=1_000_000_000,
+        sequence_id=1,
+        min_order_size=min_order_size,
+        min_notional_size=min_notional_size,
+    )
+
+
+def make_inventory_fair_value():
+    return NativeFairValueState(
+        price=Decimal("750.5"),
+        observed_at_ns=1_000_000_000,
+        stale_after_ns=5_000_000_000,
+        source="test",
+        confidence=Decimal("1"),
+    )
+
+
+def decide_inventory(position):
+    return make_inventory_policy().decide(
+        market=make_inventory_market(),
+        fair=make_inventory_fair_value(),
+        now_ns=1_000_000_000,
+        risk=NativeRiskState(
+            position_base=Decimal(position),
+            market_pnl=Decimal("0"),
+            account_pnl=Decimal("0"),
+        ),
+    )
+
+
+def test_projected_inventory_guard_allows_full_quote_at_flat_position():
+    decision = decide_inventory("0")
+
+    assert decision.bid.size is not None
+    assert decision.ask.size is not None
+    assert decision.bid.size == Decimal("100") / Decimal("750")
+    assert decision.ask.size == Decimal("100") / Decimal("751")
+
+
+def test_projected_inventory_guard_blocks_another_full_bid_after_long_fill():
+    decision = decide_inventory("0.13")
+
+    assert decision.bid.size is not None
+    assert decision.bid.size == Decimal("0.02")
+    assert decision.bid.size < Decimal("100") / Decimal("750")
+
+
+def test_projected_inventory_guard_caps_worsening_quote_to_remaining_capacity():
+    decision = decide_inventory("0.13")
+
+    assert decision.bid.size is not None
+    assert decision.bid.size == Decimal("0.15") - Decimal("0.13")
+    assert Decimal("0.13") + decision.bid.size == Decimal("0.15")
+
+
+def test_projected_inventory_guard_resizes_resting_worsening_quote():
+    decision = make_inventory_policy().decide(
+        market=make_inventory_market(),
+        fair=make_inventory_fair_value(),
+        now_ns=1_000_000_000,
+        resting={"bid": RestingQuote(price=Decimal("750"), size=Decimal("100") / Decimal("750"))},
+        risk=NativeRiskState(
+            position_base=Decimal("0.13"),
+            market_pnl=Decimal("0"),
+            account_pnl=Decimal("0"),
+        ),
+    )
+
+    assert decision.bid.action.value == "MOVE"
+    assert decision.bid.size == Decimal("0.02")
+
+
+def test_projected_inventory_guard_keeps_risk_reducing_ask_eligible_when_long():
+    decision = decide_inventory("0.13")
+
+    assert decision.ask.action.value == "PLACE"
+    assert decision.ask.size is not None
+    assert decision.ask.size == Decimal("100") / Decimal("751")
+
+
+def test_projected_inventory_guard_mirrors_behavior_for_short_inventory():
+    decision = decide_inventory("-0.13")
+
+    assert decision.ask.size is not None
+    assert decision.bid.size is not None
+    assert decision.ask.size == Decimal("0.02")
+    assert decision.bid.action.value == "PLACE"
+    assert decision.bid.size == Decimal("100") / Decimal("750")
+
+
+def test_projected_inventory_guard_never_exceeds_cap_and_suppresses_below_minimum():
+    for position in ("-0.15", "-0.149", "-0.13", "0", "0.13", "0.149", "0.15"):
+        decision = decide_inventory(position)
+        current = Decimal(position)
+        if decision.bid.size is not None:
+            assert abs(current + decision.bid.size) <= Decimal("0.15")
+        if decision.ask.size is not None:
+            assert abs(current - decision.ask.size) <= Decimal("0.15")
+
+    near_limit = make_inventory_policy().decide(
+        market=make_inventory_market(min_notional_size=Decimal("5")),
+        fair=make_inventory_fair_value(),
+        now_ns=1_000_000_000,
+        risk=NativeRiskState(
+            position_base=Decimal("0.149"),
+            market_pnl=Decimal("0"),
+            account_pnl=Decimal("0"),
+        ),
+    )
+    assert near_limit.bid.action.value == "HOLD"
+    assert near_limit.bid.reason == "INVENTORY_LIMIT_BELOW_MINIMUM"
+
+    below_minimum_size = make_inventory_policy().decide(
+        market=make_inventory_market(
+            min_order_size=Decimal("0.002"),
+            min_notional_size=Decimal("0"),
+        ),
+        fair=make_inventory_fair_value(),
+        now_ns=1_000_000_000,
+        risk=NativeRiskState(
+            position_base=Decimal("0.149"),
+            market_pnl=Decimal("0"),
+            account_pnl=Decimal("0"),
+        ),
+    )
+    assert below_minimum_size.bid.action.value == "HOLD"
+    assert below_minimum_size.bid.reason == "INVENTORY_LIMIT_BELOW_MINIMUM"
+
+
+def test_projected_inventory_guard_preserves_toxicity_veto_priority():
+    decision = make_inventory_policy().decide(
+        market=make_inventory_market(),
+        fair=make_inventory_fair_value(),
+        now_ns=1_000_000_000,
+        risk=NativeRiskState(
+            position_base=Decimal("0.149"),
+            market_pnl=Decimal("0"),
+            account_pnl=Decimal("0"),
+        ),
+        microstructure=NativeMicrostructureState(
+            volatility_bps=Decimal("0"),
+            bid_toxic_override=True,
+        ),
+    )
+
+    assert decision.bid.action.value == "HOLD"
+    assert decision.bid.reason == "BID_TOXIC"
 
 
 class FakeMarketDataProvider:
@@ -347,7 +522,7 @@ def test_native_controller_reuses_quote_policy_for_market_reference_and_risk_par
             confidence=Decimal("1"),
         ),
         now_ns=2_000_000_000,
-        risk=RiskState(
+        risk=NativeRiskState(
             position_base=Decimal("0.5"),
             market_pnl=Decimal("-5"),
             account_pnl=Decimal("-7"),
@@ -433,8 +608,9 @@ def test_native_controller_uses_exchange_position_as_authoritative_restart_inven
 
     assert risk.position_base == Decimal("-0.06")
     assert risk.market_pnl == Decimal("-1.25")
-    assert decision.state_reason == "INVENTORY_SHORT_LIMIT"
+    assert decision.state_reason == "NORMAL"
     assert decision.ask.action.value == "HOLD"
+    assert decision.ask.reason == "INVENTORY_LIMIT_BELOW_MINIMUM"
     assert decision.bid.action.value == "PLACE"
 
 

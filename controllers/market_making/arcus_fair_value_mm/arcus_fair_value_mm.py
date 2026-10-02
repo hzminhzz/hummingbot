@@ -403,6 +403,11 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             self.config.connector_name,
             self.config.trading_pair,
         )
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            trading_rule = getattr(connector, "trading_rules", {}).get(self.config.trading_pair)
+        except (AttributeError, ValueError):
+            trading_rule = None
 
         external = await self._hyperliquid_reference_quote(now_ns)
         market = MarketState(
@@ -413,6 +418,16 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             mark=Decimal(funding_info.mark_price),
             observed_at_ns=now_ns,
             sequence_id=now_ns,
+            min_order_size=(
+                Decimal(trading_rule.min_order_size)
+                if trading_rule is not None
+                else Decimal("0")
+            ),
+            min_notional_size=(
+                Decimal(trading_rule.min_notional_size)
+                if trading_rule is not None
+                else Decimal("0")
+            ),
         )
         fair = FairValueState(
             price=Decimal(external.price),

@@ -35,6 +35,8 @@ class MarketState:
     mark: Decimal
     observed_at_ns: int
     sequence_id: int
+    min_order_size: Decimal = Decimal("0")
+    min_notional_size: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,17 @@ class QuotePolicy:
             microstructure
         )
         bid_inventory_multiplier, ask_inventory_multiplier = self._inventory_size_multipliers(risk)
+        bid_inventory_limit = None
+        ask_inventory_limit = None
+        if risk is not None and self.config.max_abs_inventory is not None:
+            bid_inventory_limit = max(
+                Decimal("0"),
+                self.config.max_abs_inventory - risk.position_base,
+            )
+            ask_inventory_limit = max(
+                Decimal("0"),
+                self.config.max_abs_inventory + risk.position_base,
+            )
 
         upper_bid = fair.price * (Decimal("1") + self.config.max_quote_deviation_bps / _BPS)
         lower_ask = fair.price * (Decimal("1") - self.config.max_quote_deviation_bps / _BPS)
@@ -137,6 +150,9 @@ class QuotePolicy:
             resting=resting.get("bid"),
             unsafe_reason="BID_ABOVE_FAIR_VALUE_BOUND",
             size_multiplier=bid_inventory_multiplier * micro_multiplier,
+            max_size=bid_inventory_limit,
+            min_order_size=market.min_order_size,
+            min_notional_size=market.min_notional_size,
         )
         ask = self._side_intent(
             side="ask",
@@ -147,6 +163,9 @@ class QuotePolicy:
             resting=resting.get("ask"),
             unsafe_reason="ASK_BELOW_FAIR_VALUE_BOUND",
             size_multiplier=ask_inventory_multiplier * micro_multiplier,
+            max_size=ask_inventory_limit,
+            min_order_size=market.min_order_size,
+            min_notional_size=market.min_notional_size,
         )
 
         if toxic_bid:
@@ -164,23 +183,6 @@ class QuotePolicy:
                     state_id=state_id,
                     position=risk.position_base,
                     reason=pause_reason,
-                )
-
-            inventory_reason = None
-            if self.config.max_abs_inventory is not None:
-                if risk.position_base >= self.config.max_abs_inventory:
-                    bid = self._closed_side(resting.get("bid"), state_id, "INVENTORY_LONG_LIMIT")
-                    inventory_reason = "INVENTORY_LONG_LIMIT"
-                elif risk.position_base <= -self.config.max_abs_inventory:
-                    ask = self._closed_side(resting.get("ask"), state_id, "INVENTORY_SHORT_LIMIT")
-                    inventory_reason = "INVENTORY_SHORT_LIMIT"
-
-            if micro_state is OperatingState.GOOD and inventory_reason is not None:
-                return QuoteDecision(
-                    bid=bid,
-                    ask=ask,
-                    state=OperatingState.GOOD,
-                    state_reason=inventory_reason,
                 )
 
         return QuoteDecision(
@@ -354,6 +356,9 @@ class QuotePolicy:
         resting: RestingQuote | None,
         unsafe_reason: str,
         size_multiplier: Decimal = Decimal("1"),
+        max_size: Decimal | None = None,
+        min_order_size: Decimal = Decimal("0"),
+        min_notional_size: Decimal = Decimal("0"),
     ) -> QuoteIntent:
         if not safe:
             if resting is not None:
@@ -361,6 +366,14 @@ class QuotePolicy:
             return QuoteIntent(QuoteAction.HOLD, None, None, unsafe_reason, state_id)
 
         target_size = self.config.quote_notional / target_price * size_multiplier
+        if max_size is not None:
+            target_size = min(target_size, max_size)
+        if (
+            target_size <= 0
+            or target_size < min_order_size
+            or target_size * target_price < min_notional_size
+        ):
+            return self._closed_side(resting, state_id, "INVENTORY_LIMIT_BELOW_MINIMUM")
         if resting is None:
             return QuoteIntent(
                 QuoteAction.PLACE,
@@ -369,7 +382,11 @@ class QuotePolicy:
                 f"{side.upper()}_SAFE_AT_TOUCH",
                 state_id,
             )
-        if size_multiplier < Decimal("1") and resting.size > target_size:
+        size_is_reduced = size_multiplier < Decimal("1") or (
+            max_size is not None
+            and target_size < self.config.quote_notional / target_price * size_multiplier
+        )
+        if size_is_reduced and resting.size > target_size:
             return QuoteIntent(
                 QuoteAction.MOVE,
                 target_price,
