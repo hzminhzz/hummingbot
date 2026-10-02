@@ -44,5 +44,5 @@ class ArcusPerpetualWebUtilsTests(unittest.IsolatedAsyncioTestCase):
 
         current_time = await get_current_server_time()
 
-        self.assertAlmostEqual(1_700_000_000.123456, current_time, places=6)
+        self.assertAlmostEqual(1_700_000_000_123.456, current_time, places=3)
         mock_api.assert_called_once()

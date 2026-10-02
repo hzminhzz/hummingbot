@@ -56,4 +56,4 @@ async def get_current_server_time(
     )
     if not isinstance(response, dict) or "timeNs" not in response:
         raise IOError(f"Unexpected Arcus time response: {response}")
-    return int(response["timeNs"]) * 1e-9
+    return int(response["timeNs"]) * 1e-6
