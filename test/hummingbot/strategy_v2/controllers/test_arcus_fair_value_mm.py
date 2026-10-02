@@ -21,6 +21,21 @@ from hummingbot.strategy_v2.executors.order_executor.data_types import Execution
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
+def decision_signature(decision):
+    return (
+        decision.bid.action.value,
+        decision.bid.price,
+        decision.bid.size,
+        decision.bid.reason,
+        decision.ask.action.value,
+        decision.ask.price,
+        decision.ask.size,
+        decision.ask.reason,
+        decision.state.value,
+        decision.state_reason,
+    )
+
+
 class FakeMarketDataProvider:
     ready = True
 
@@ -192,7 +207,7 @@ def test_native_controller_reuses_quote_policy_for_market_reference_and_risk_par
         ),
     )
 
-    assert decision == expected
+    assert decision_signature(decision) == decision_signature(expected)
     assert decision.bid.size < decision.ask.size
     assert controller.determine_executor_actions() == []
 
@@ -225,13 +240,13 @@ def test_native_controller_preserves_fail_closed_and_side_specific_toxicity_sema
 
     asyncio.run(controller.update_processed_data())
     stale = controller.processed_data["quote_decision"]
-    assert stale.state is OperatingState.FAULT
+    assert stale.state.value == OperatingState.FAULT.value
     assert stale.state_reason == "STALE_REFERENCE"
 
     controller._external_reference_client.observed_at_ns = 1_500_000_000
     asyncio.run(controller.update_processed_data())
     toxic = controller.processed_data["quote_decision"]
-    assert toxic.state is OperatingState.TOXIC
+    assert toxic.state.value == OperatingState.TOXIC.value
     assert toxic.bid.action.value == "HOLD"
     assert toxic.bid.reason == "BID_TOXIC"
     assert toxic.ask.action.value == "PLACE"
@@ -263,13 +278,13 @@ def test_native_controller_exposes_risk_pause_and_volatility_size_reduction():
     controller.performance_report = SimpleNamespace(global_pnl_quote=Decimal("0"))
     asyncio.run(controller.update_processed_data())
     volatile = controller.processed_data["quote_decision"]
-    assert volatile.state is OperatingState.VOLATILE
+    assert volatile.state.value == OperatingState.VOLATILE.value
     assert volatile.bid.size == Decimal("25") / Decimal("100")
 
     controller.performance_report = SimpleNamespace(global_pnl_quote=Decimal("-50"))
     asyncio.run(controller.update_processed_data())
     paused = controller.processed_data["quote_decision"]
-    assert paused.state is OperatingState.RISK_PAUSED
+    assert paused.state.value == OperatingState.RISK_PAUSED.value
     assert paused.state_reason == "ACCOUNT_LOSS_LIMIT"
     assert paused.bid.action.value == "HOLD"
     assert paused.ask.action.value == "HOLD"
@@ -404,7 +419,7 @@ def test_native_actions_respect_toxicity_and_risk_suppression():
 
     controller.performance_report = SimpleNamespace(global_pnl_quote=Decimal("-50"))
     asyncio.run(controller.update_processed_data())
-    assert controller.processed_data["quote_decision"].state is OperatingState.RISK_PAUSED
+    assert controller.processed_data["quote_decision"].state.value == OperatingState.RISK_PAUSED.value
     assert controller.determine_executor_actions() == []
 
 

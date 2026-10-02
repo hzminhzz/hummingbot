@@ -2,18 +2,6 @@ import asyncio
 from decimal import Decimal
 from typing import Callable, List, Optional
 
-from arcus_mm.external_reference import YahooReferenceClient
-from arcus_mm.microstructure import MicrostructureState
-from arcus_mm.quote_policy import (
-    FairValueState,
-    MarketState,
-    QuoteAction,
-    QuoteDecision,
-    QuotePolicy,
-    QuotePolicyConfig,
-    RestingQuote,
-)
-from arcus_mm.risk import RiskState
 from pydantic import Field, model_validator
 
 from hummingbot.core.data_type.common import PositionMode, PriceType, TradeType
@@ -23,6 +11,19 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
 )
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
+
+from .domain.external_reference import YahooReferenceClient
+from .domain.microstructure import MicrostructureState
+from .domain.quote_policy import (
+    FairValueState,
+    MarketState,
+    QuoteAction,
+    QuoteDecision,
+    QuotePolicy,
+    QuotePolicyConfig,
+    RestingQuote,
+)
+from .domain.risk import RiskState
 
 
 class ArcusFairValueMMConfig(MarketMakingControllerConfigBase):
