@@ -17,6 +17,8 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
 )
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
 class FakeMarketDataProvider:
@@ -271,3 +273,157 @@ def test_native_controller_exposes_risk_pause_and_volatility_size_reduction():
     assert paused.state_reason == "ACCOUNT_LOSS_LIMIT"
     assert paused.bid.action.value == "HOLD"
     assert paused.ask.action.value == "HOLD"
+
+
+def make_active_quote_executor(executor_id, side, price, amount):
+    level_id = "arcus_bid" if side is TradeType.BUY else "arcus_ask"
+    config = OrderExecutorConfig(
+        timestamp=1.0,
+        connector_name="arcus_perpetual",
+        trading_pair="SPY-USD",
+        side=side,
+        amount=amount,
+        price=price,
+        execution_strategy=ExecutionStrategy.LIMIT_MAKER,
+        leverage=1,
+        level_id=level_id,
+    )
+    return SimpleNamespace(
+        id=executor_id,
+        is_active=True,
+        config=config,
+        custom_info={"level_id": level_id, "side": side},
+    )
+
+
+def test_native_actions_place_keep_move_cancel_hold_with_limit_maker_only():
+    provider = FakeMarketDataProvider()
+    external = FakeExternalReference(observed_at_ns=1_500_000_000)
+    config = ArcusFairValueMMConfig(
+        id="arcus-execution",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        reference_stale_after_seconds=Decimal("5"),
+        observation_only=False,
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=external,
+    )
+
+    asyncio.run(controller.update_processed_data())
+    place_actions = controller.determine_executor_actions()
+    assert len(place_actions) == 2
+    assert all(isinstance(action, CreateExecutorAction) for action in place_actions)
+    created = {action.executor_config.side: action.executor_config for action in place_actions}
+    assert set(created) == {TradeType.BUY, TradeType.SELL}
+    assert all(isinstance(c, OrderExecutorConfig) for c in created.values())
+    assert all(c.execution_strategy is ExecutionStrategy.LIMIT_MAKER for c in created.values())
+    assert created[TradeType.BUY].level_id == "arcus_bid"
+    assert created[TradeType.SELL].level_id == "arcus_ask"
+    assert created[TradeType.BUY].price == Decimal("100")
+    assert created[TradeType.SELL].price == Decimal("101")
+
+    controller.executors_info = [
+        make_active_quote_executor("bid-1", TradeType.BUY, Decimal("100"), created[TradeType.BUY].amount),
+        make_active_quote_executor("ask-1", TradeType.SELL, Decimal("101"), created[TradeType.SELL].amount),
+    ]
+    asyncio.run(controller.update_processed_data())
+    assert controller.processed_data["quote_decision"].bid.action.value == "KEEP"
+    assert controller.processed_data["quote_decision"].ask.action.value == "KEEP"
+    assert controller.determine_executor_actions() == []
+
+    provider.bid = Decimal("99.5")
+    provider.ask = Decimal("101.5")
+    asyncio.run(controller.update_processed_data())
+    move_actions = controller.determine_executor_actions()
+    assert {type(action) for action in move_actions} == {StopExecutorAction}
+    assert {action.executor_id for action in move_actions} == {"bid-1", "ask-1"}
+
+    controller.executors_info = []
+    asyncio.run(controller.update_processed_data())
+    replacement_actions = controller.determine_executor_actions()
+    assert len(replacement_actions) == 2
+    assert all(isinstance(action, CreateExecutorAction) for action in replacement_actions)
+
+    controller.executors_info = [
+        make_active_quote_executor("bid-2", TradeType.BUY, Decimal("99.5"), Decimal("0.5")),
+        make_active_quote_executor("ask-2", TradeType.SELL, Decimal("101.5"), Decimal("0.5")),
+    ]
+    controller._external_reference_client.observed_at_ns = 0
+    provider.now = 10.0
+    asyncio.run(controller.update_processed_data())
+    cancel_actions = controller.determine_executor_actions()
+    assert {type(action) for action in cancel_actions} == {StopExecutorAction}
+    assert {action.executor_id for action in cancel_actions} == {"bid-2", "ask-2"}
+
+    controller.executors_info = []
+    asyncio.run(controller.update_processed_data())
+    assert controller.processed_data["quote_decision"].bid.action.value == "HOLD"
+    assert controller.processed_data["quote_decision"].ask.action.value == "HOLD"
+    assert controller.determine_executor_actions() == []
+
+
+def test_native_actions_respect_toxicity_and_risk_suppression():
+    provider = FakeMarketDataProvider()
+    external = FakeExternalReference(observed_at_ns=1_500_000_000)
+    micro = MicrostructureState(
+        volatility_bps=Decimal("0"),
+        bid_recent_markout_bps=Decimal("-2"),
+        ask_recent_markout_bps=Decimal("1"),
+    )
+    config = ArcusFairValueMMConfig(
+        id="arcus-suppression",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        toxic_markout_threshold_bps=Decimal("-1"),
+        account_loss_limit=Decimal("50"),
+        observation_only=False,
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=external,
+        microstructure_state_provider=lambda: micro,
+    )
+
+    controller.performance_report = SimpleNamespace(global_pnl_quote=Decimal("0"))
+    asyncio.run(controller.update_processed_data())
+    toxic_actions = controller.determine_executor_actions()
+    assert len(toxic_actions) == 1
+    assert isinstance(toxic_actions[0], CreateExecutorAction)
+    assert toxic_actions[0].executor_config.side is TradeType.SELL
+    assert toxic_actions[0].executor_config.execution_strategy is ExecutionStrategy.LIMIT_MAKER
+
+    controller.performance_report = SimpleNamespace(global_pnl_quote=Decimal("-50"))
+    asyncio.run(controller.update_processed_data())
+    assert controller.processed_data["quote_decision"].state is OperatingState.RISK_PAUSED
+    assert controller.determine_executor_actions() == []
+
+
+def test_observation_mode_never_emits_native_executor_actions():
+    provider = FakeMarketDataProvider()
+    controller = ArcusFairValueMMController(
+        config=ArcusFairValueMMConfig(
+            id="arcus-observe",
+            trading_pair="SPY-USD",
+            quote_notional=Decimal("50"),
+            max_quote_deviation_bps=Decimal("100"),
+            max_reference_disagreement_bps=Decimal("100"),
+            observation_only=True,
+        ),
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+        external_reference_client=FakeExternalReference(observed_at_ns=1_500_000_000),
+    )
+
+    asyncio.run(controller.update_processed_data())
+    assert controller.processed_data["quote_decision"].bid.action.value == "PLACE"
+    assert controller.determine_executor_actions() == []

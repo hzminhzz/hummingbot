@@ -7,6 +7,7 @@ from arcus_mm.microstructure import MicrostructureState
 from arcus_mm.quote_policy import (
     FairValueState,
     MarketState,
+    QuoteAction,
     QuoteDecision,
     QuotePolicy,
     QuotePolicyConfig,
@@ -20,7 +21,8 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
 )
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 
 
 class ArcusFairValueMMConfig(MarketMakingControllerConfigBase):
@@ -116,8 +118,8 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             account_pnl=account_pnl,
         )
 
-    def _current_resting_quotes(self) -> dict[str, RestingQuote]:
-        resting = {}
+    def _active_quote_executors(self) -> dict[str, object]:
+        active = {}
         for executor in self.executors_info:
             if not executor.is_active:
                 continue
@@ -126,15 +128,22 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
                 continue
             if getattr(config, "trading_pair", None) != self.config.trading_pair:
                 continue
+            level_id = getattr(config, "level_id", None)
+            if level_id == "arcus_bid":
+                active["bid"] = executor
+            elif level_id == "arcus_ask":
+                active["ask"] = executor
+        return active
+
+    def _current_resting_quotes(self) -> dict[str, RestingQuote]:
+        resting = {}
+        for side, executor in self._active_quote_executors().items():
+            config = executor.config
             price = getattr(config, "price", None)
             amount = getattr(config, "amount", None)
-            side = getattr(config, "side", None)
-            if price is None or amount is None or side not in (TradeType.BUY, TradeType.SELL):
+            if price is None or amount is None:
                 continue
-            resting["bid" if side == TradeType.BUY else "ask"] = RestingQuote(
-                price=Decimal(price),
-                size=Decimal(amount),
-            )
+            resting[side] = RestingQuote(price=Decimal(price), size=Decimal(amount))
         return resting
 
     async def update_processed_data(self):
@@ -198,8 +207,49 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             "spread_multiplier": Decimal("1"),
         }
 
+    def _create_quote_action(self, side: str, price: Decimal, amount: Decimal) -> CreateExecutorAction:
+        trade_type = TradeType.BUY if side == "bid" else TradeType.SELL
+        executor_config = OrderExecutorConfig(
+            timestamp=self.market_data_provider.time(),
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            side=trade_type,
+            amount=amount,
+            price=price,
+            execution_strategy=ExecutionStrategy.LIMIT_MAKER,
+            leverage=self.config.leverage,
+            level_id=f"arcus_{side}",
+        )
+        return CreateExecutorAction(controller_id=self.config.id, executor_config=executor_config)
+
+    def determine_executor_actions(self) -> List[ExecutorAction]:
+        if self.config.observation_only:
+            return []
+        decision = self.processed_data.get("quote_decision")
+        if decision is None:
+            return []
+
+        active = self._active_quote_executors()
+        actions: List[ExecutorAction] = []
+        for side, intent in (("bid", decision.bid), ("ask", decision.ask)):
+            executor = active.get(side)
+            if intent.action in (QuoteAction.CANCEL, QuoteAction.MOVE):
+                if executor is not None:
+                    actions.append(
+                        StopExecutorAction(
+                            controller_id=self.config.id,
+                            executor_id=executor.id,
+                            keep_position=True,
+                        )
+                    )
+                continue
+            if intent.action is QuoteAction.PLACE and executor is None:
+                if intent.price is not None and intent.size is not None:
+                    actions.append(self._create_quote_action(side, intent.price, intent.size))
+        return actions
+
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
-        return []
+        return [a for a in self.determine_executor_actions() if isinstance(a, CreateExecutorAction)]
 
     def stop_actions_proposal(self) -> List[StopExecutorAction]:
-        return []
+        return [a for a in self.determine_executor_actions() if isinstance(a, StopExecutorAction)]
