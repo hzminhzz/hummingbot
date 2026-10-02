@@ -12,7 +12,7 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 
-from .domain.external_reference import YahooReferenceClient
+from .domain.external_reference import ExternalReferenceQuote
 from .domain.microstructure import MicrostructureState
 from .domain.quote_policy import (
     FairValueState,
@@ -40,8 +40,14 @@ class ArcusFairValueMMConfig(MarketMakingControllerConfigBase):
     max_quote_deviation_bps: Decimal = Field(default=Decimal("5"), ge=0)
     max_reference_disagreement_bps: Decimal = Field(default=Decimal("20"), ge=0)
     reference_stale_after_seconds: Decimal = Field(default=Decimal("5"), gt=0)
-    external_reference_symbol: Optional[str] = None
-    external_reference_source: str = "yahoo"
+    external_reference_symbol: str = "XYZ:SP500-USD"
+    external_reference_source: str = "hyperliquid_sp500"
+    external_reference_connector: str = "hyperliquid_perpetual"
+    reference_anchor_spy_price: Optional[Decimal] = Field(default=None, gt=0)
+    reference_anchor_hyperliquid_price: Optional[Decimal] = Field(default=None, gt=0)
+    reference_anchor_timestamp_ns: Optional[int] = Field(default=None, gt=0)
+    reference_anchor_max_age_seconds: Decimal = Field(default=Decimal("432000"), gt=0)
+    reference_max_spread_bps: Decimal = Field(default=Decimal("20"), gt=0)
 
     max_abs_inventory: Optional[Decimal] = Field(default=None, gt=0)
     inventory_skew_at_limit: Decimal = Field(default=Decimal("0"), ge=0, le=1)
@@ -75,7 +81,8 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
     ):
         super().__init__(config, *args, **kwargs)
         self.config = config
-        self._external_reference_client = external_reference_client or YahooReferenceClient()
+        self._external_reference_client = external_reference_client
+        self._reference_order_book_initialized = False
         self._microstructure_state_provider = microstructure_state_provider or (lambda: None)
         self._policy = QuotePolicy(self._quote_policy_config())
 
@@ -147,6 +154,64 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             resting[side] = RestingQuote(price=Decimal(price), size=Decimal(amount))
         return resting
 
+    def _invalid_reference(self, source: str) -> ExternalReferenceQuote:
+        return ExternalReferenceQuote(
+            symbol=self.config.external_reference_symbol,
+            price=Decimal("0"),
+            observed_at_ns=0,
+            source=source,
+        )
+
+    async def _hyperliquid_reference_quote(self, now_ns: int) -> ExternalReferenceQuote:
+        if self._external_reference_client is not None:
+            return await asyncio.to_thread(
+                self._external_reference_client.get,
+                self.config.external_reference_symbol,
+            )
+
+        anchor_spy = self.config.reference_anchor_spy_price
+        anchor_hl = self.config.reference_anchor_hyperliquid_price
+        anchor_ts = self.config.reference_anchor_timestamp_ns
+        if anchor_spy is None or anchor_hl is None or anchor_ts is None:
+            return self._invalid_reference("hyperliquid_sp500:MISSING_ANCHOR")
+
+        anchor_max_age_ns = int(self.config.reference_anchor_max_age_seconds * Decimal("1000000000"))
+        if now_ns - anchor_ts > anchor_max_age_ns:
+            return self._invalid_reference("hyperliquid_sp500:STALE_ANCHOR")
+
+        if not self._reference_order_book_initialized:
+            initialized = await self.market_data_provider.initialize_order_book(
+                self.config.external_reference_connector,
+                self.config.external_reference_symbol,
+            )
+            if not initialized:
+                return self._invalid_reference("hyperliquid_sp500:ORDER_BOOK_INIT_FAILED")
+            self._reference_order_book_initialized = True
+
+        order_book = self.market_data_provider.get_order_book(
+            self.config.external_reference_connector,
+            self.config.external_reference_symbol,
+        )
+        bid = Decimal(str(order_book.get_price(False)))
+        ask = Decimal(str(order_book.get_price(True)))
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return self._invalid_reference("hyperliquid_sp500:INVALID_BOOK")
+
+        mid = (bid + ask) / Decimal("2")
+        spread_bps = (ask - bid) / mid * Decimal("10000")
+        if spread_bps > self.config.reference_max_spread_bps:
+            return self._invalid_reference("hyperliquid_sp500:WIDE_BOOK")
+
+        update_id_ms = max(int(order_book.snapshot_uid), int(order_book.last_diff_uid))
+        observed_at_ns = update_id_ms * 1_000_000
+        ratio = anchor_spy / anchor_hl
+        return ExternalReferenceQuote(
+            symbol=self.config.external_reference_symbol,
+            price=mid * ratio,
+            observed_at_ns=observed_at_ns,
+            source=f"hyperliquid:{self.config.external_reference_symbol}:anchored_ratio",
+        )
+
     async def update_processed_data(self):
         now_ns = int(self.market_data_provider.time() * 1_000_000_000)
         bid = Decimal(
@@ -168,8 +233,7 @@ class ArcusFairValueMMController(MarketMakingControllerBase):
             self.config.trading_pair,
         )
 
-        reference_symbol = self.config.external_reference_symbol or self.config.trading_pair
-        external = await asyncio.to_thread(self._external_reference_client.get, reference_symbol)
+        external = await self._hyperliquid_reference_quote(now_ns)
         market = MarketState(
             symbol=self.config.trading_pair,
             bid=bid,

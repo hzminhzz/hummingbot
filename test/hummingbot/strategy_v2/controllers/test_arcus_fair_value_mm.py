@@ -45,6 +45,10 @@ class FakeMarketDataProvider:
         self.ask = Decimal("101")
         self.oracle = Decimal("100.5")
         self.mark = Decimal("100.5")
+        self.hl_bid = Decimal("1000")
+        self.hl_ask = Decimal("1002")
+        self.hl_update_id_ms = 1500
+        self.order_book_initializations = []
         self.now = 2.0
 
     def initialize_rate_sources(self, sources):
@@ -57,16 +61,35 @@ class FakeMarketDataProvider:
         return self.now
 
     def get_price_by_type(self, connector_name, trading_pair, price_type):
-        assert connector_name == "arcus_perpetual"
-        assert trading_pair == "SPY-USD"
-        if price_type is PriceType.BestBid:
-            return self.bid
-        if price_type is PriceType.BestAsk:
-            return self.ask
-        raise AssertionError(price_type)
+        if connector_name == "arcus_perpetual":
+            assert trading_pair == "SPY-USD"
+            if price_type is PriceType.BestBid:
+                return self.bid
+            if price_type is PriceType.BestAsk:
+                return self.ask
+        elif connector_name == "hyperliquid_perpetual":
+            assert trading_pair == "XYZ:SP500-USD"
+            if price_type is PriceType.BestBid:
+                return self.hl_bid
+            if price_type is PriceType.BestAsk:
+                return self.hl_ask
+        raise AssertionError((connector_name, trading_pair, price_type))
 
     def get_funding_info(self, connector_name, trading_pair):
         return SimpleNamespace(index_price=self.oracle, mark_price=self.mark)
+
+    async def initialize_order_book(self, connector_name, trading_pair):
+        self.order_book_initializations.append((connector_name, trading_pair))
+        return True
+
+    def get_order_book(self, connector_name, trading_pair):
+        assert connector_name == "hyperliquid_perpetual"
+        assert trading_pair == "XYZ:SP500-USD"
+        return SimpleNamespace(
+            snapshot_uid=self.hl_update_id_ms,
+            last_diff_uid=self.hl_update_id_ms,
+            get_price=lambda is_buy: self.hl_ask if is_buy else self.hl_bid,
+        )
 
 
 class FakeExternalReference:
@@ -135,6 +158,77 @@ def test_arcus_controller_loads_through_standard_v2_controller_loader(tmp_path, 
 
     assert isinstance(loaded, ArcusFairValueMMConfig)
     assert loaded.get_controller_class() is ArcusFairValueMMController
+
+
+def test_native_controller_builds_fresh_spy_fair_value_from_hyperliquid_anchor():
+    provider = FakeMarketDataProvider()
+    config = ArcusFairValueMMConfig(
+        id="arcus-hl-reference",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        reference_stale_after_seconds=Decimal("5"),
+        reference_anchor_spy_price=Decimal("100"),
+        reference_anchor_hyperliquid_price=Decimal("1000"),
+        reference_anchor_timestamp_ns=1_000_000_000,
+        reference_anchor_max_age_seconds=Decimal("100"),
+        reference_max_spread_bps=Decimal("30"),
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+    )
+
+    asyncio.run(controller.update_processed_data())
+    fair = controller.processed_data["fair_value_state"]
+    decision = controller.processed_data["quote_decision"]
+
+    assert fair.price == Decimal("100.1")
+    assert fair.observed_at_ns == 1_500_000_000
+    assert fair.source == "hyperliquid:XYZ:SP500-USD:anchored_ratio"
+    assert decision.state.value == OperatingState.GOOD.value
+    assert provider.order_book_initializations == [("hyperliquid_perpetual", "XYZ:SP500-USD")]
+
+    asyncio.run(controller.update_processed_data())
+    assert provider.order_book_initializations == [("hyperliquid_perpetual", "XYZ:SP500-USD")]
+
+
+def test_hyperliquid_reference_fails_closed_on_stale_live_book_and_stale_anchor():
+    provider = FakeMarketDataProvider()
+    config = ArcusFairValueMMConfig(
+        id="arcus-hl-stale",
+        trading_pair="SPY-USD",
+        quote_notional=Decimal("50"),
+        max_quote_deviation_bps=Decimal("100"),
+        max_reference_disagreement_bps=Decimal("100"),
+        reference_stale_after_seconds=Decimal("1"),
+        reference_anchor_spy_price=Decimal("100"),
+        reference_anchor_hyperliquid_price=Decimal("1000"),
+        reference_anchor_timestamp_ns=1_000_000_000,
+        reference_anchor_max_age_seconds=Decimal("100"),
+    )
+    controller = ArcusFairValueMMController(
+        config=config,
+        market_data_provider=provider,
+        actions_queue=asyncio.Queue(),
+    )
+
+    provider.now = 10.0
+    provider.hl_update_id_ms = 1_000
+    asyncio.run(controller.update_processed_data())
+    stale_book = controller.processed_data["quote_decision"]
+    assert stale_book.state.value == OperatingState.FAULT.value
+    assert stale_book.state_reason == "STALE_REFERENCE"
+
+    provider.now = 200.0
+    provider.hl_update_id_ms = 200_000
+    asyncio.run(controller.update_processed_data())
+    stale_anchor = controller.processed_data["quote_decision"]
+    assert stale_anchor.state.value == OperatingState.FAULT.value
+    assert stale_anchor.state_reason == "INVALID_REFERENCE"
+    assert controller.processed_data["fair_value_state"].source == "hyperliquid_sp500:STALE_ANCHOR"
 
 
 def test_native_controller_reuses_quote_policy_for_market_reference_and_risk_parity():
